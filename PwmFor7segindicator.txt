@@ -1,0 +1,423 @@
+#include <stdio.h>
+#include <unistd.h>
+#include <string.h>
+#include "includes.h"
+#include "alt_ucosii_simple_error_check.h"
+#include "altera_avalon_pio_regs.h"
+
+/* Стеки задач */
+#define   TASK_STACKSIZE       1024
+OS_STK    initialize_task_stk[TASK_STACKSIZE];
+OS_STK    print_status_task_stk[TASK_STACKSIZE];
+OS_STK    getsem_task1_stk[TASK_STACKSIZE];
+OS_STK    getsem_task2_stk[TASK_STACKSIZE];
+OS_STK    receive_task1_stk[TASK_STACKSIZE];
+OS_STK    receive_task2_stk[TASK_STACKSIZE];
+OS_STK    send_task_stk[TASK_STACKSIZE];
+OS_STK    start_timer_stk[TASK_STACKSIZE];
+
+/* Приоритеты задач */
+#define INITIALIZE_TASK_PRIORITY   6
+#define PRINT_STATUS_TASK_PRIORITY 7
+#define GETSEM_TASK1_PRIORITY      8
+#define GETSEM_TASK2_PRIORITY      9
+#define RECEIVE_TASK1_PRIORITY    10
+#define RECEIVE_TASK2_PRIORITY    11
+#define SEND_TASK_PRIORITY        12
+#define STARTTIMER_TASK_PRIORITY  13
+
+/* Объявление очереди */
+#define   MSG_QUEUE_SIZE  30            //Size of message queue used in example
+OS_EVENT  *msgqueue;                    //Message queue pointer
+void      *msgqueueTbl[MSG_QUEUE_SIZE]; // Storage for messages
+
+OS_EVENT *mBox;
+
+//Таймер для ШИМ
+OS_TMR *MyTmr2;
+
+//Переменные для ШИМ 
+int pwm = 0;
+int up = 0;
+int tmp = 0;
+int counter = 0;
+int counterSize = 25;
+int currentCounter = 0;
+
+OS_EVENT  *timerqueue;                    //Message queue pointer
+void      *timerqueueTbl[MSG_QUEUE_SIZE];
+
+/* Объявление семафора */
+OS_EVENT *shared_resource_sem;
+OS_EVENT *int_sem;
+
+/* Глобальные переменные */
+INT32U number_of_messages_sent = 0;
+INT32U number_of_messages_received_task1 = 0;
+INT32U number_of_messages_received_task2 = 0;
+INT32U getsem_task1_got_sem = 0;
+INT32U getsem_task2_got_sem = 0;
+char sem_owner_task_name[20];
+
+static alt_u8 segments[16] = {
+    0xC0, 0xF9, 0xA4, 0xB0, 0x99, 0x92, 0x82, 0xF8, 0x80, 0x90, /* 0-9 */
+    0x88, 0x83, 0xC6, 0xA1, 0x86, 0x8E };                       /* a-f */
+
+/* Прототипы функций */
+int initOSDataStructs(void);
+int initCreateTasks(void);
+
+#ifdef ALT_ENHANCED_INTERRUPT_API_PRESENT
+static void handle_button_interrupts(void* context)
+#else
+static void handle_button_interrupts(void* context, alt_u32 id)
+#endif
+{
+	OSIntEnter();
+	/*
+	* Read the edge capture register on the button PIO.
+	* Store value.
+	*/
+	INT8U value = IORD_ALTERA_AVALON_PIO_EDGE_CAP(BUTTONS_BASE);
+	/* Write to the edge capture register to reset it. */
+	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(BUTTONS_BASE, 0);
+
+	/* Read the PIO to delay ISR exit. This is done to prevent a
+	spurious interrupt in systems with high processor -> pio
+	latency and fast interrupts. */
+	IORD_ALTERA_AVALON_PIO_EDGE_CAP(BUTTONS_BASE);
+
+	OSMboxPost(mBox, (void *)value);
+
+	OSIntExit();
+}
+
+/* Initialize the button_pio. */
+
+static void init_button_piof()
+{
+
+	/* Enable all 4 button interrupts. */
+	IOWR_ALTERA_AVALON_PIO_IRQ_MASK(BUTTONS_BASE, 0xf);
+	/* Reset the edge capture register. */
+	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(BUTTONS_BASE, 0x0);
+	/* Register the ISR. */
+	#ifdef ALT_ENHANCED_INTERRUPT_API_PRESENT
+	alt_ic_isr_register(BUTTONS_IRQ_INTERRUPT_CONTROLLER_ID,BUTTONS_IRQ,handle_button_interrupts,0, 0x0);
+	#else
+	alt_irq_register(BUTTON_PIO_IRQ,0, handle_button_interrupts);
+	#endif
+
+}
+
+static void set_hex_data(INT8U hex, INT8U position) {
+	INT32U mask = (INT32U) 0xff << position * 8;
+	INT32U current_data = IORD_ALTERA_AVALON_PIO_DATA(SEVEN_SEG_BASE);
+	INT32U _current_data = current_data & ~mask;
+	INT32U new_data = (segments[hex] << (position * 8)) | _current_data;
+	IOWR_ALTERA_AVALON_PIO_DATA(SEVEN_SEG_BASE, new_data);
+}
+
+void print_status_task(void* pdata)
+{
+  while (1)
+  {
+    OSTimeDlyHMSM(0, 0, 3, 0);
+    printf("****************************************************************\n");
+    printf("Hello From MicroC/OS-II Running on NIOS II.  Here is the status:\n");
+    printf("\n");
+    printf("The number of messages sent by the send_task:         %lu\n",
+            number_of_messages_sent);
+    printf("\n");
+    printf("The number of messages received by the receive_task1: %lu\n",
+            number_of_messages_received_task1);
+    printf("\n");
+    printf("The number of messages received by the receive_task2: %lu\n",
+            number_of_messages_received_task2);
+    printf("\n");
+    printf("The shared resource is owned by: %s\n",
+           &sem_owner_task_name[0]);
+    printf("\n");
+    printf("The Number of times getsem_task1 acquired the semaphore %lu\n",
+            getsem_task1_got_sem);
+    printf("\n");
+    printf("The Number of times getsem_task2 acquired the semaphore %lu\n",
+            getsem_task2_got_sem);
+    printf("\n");
+   printf("****************************************************************\n");
+    printf("\n");
+  }
+}
+
+void getsem_task1(void* pdata)
+{
+  INT8U return_code = OS_NO_ERR;
+
+  while (1)
+  {
+    OSSemPend(shared_resource_sem, 0, &return_code);
+    alt_ucosii_check_return_code(return_code);
+    strcpy(&sem_owner_task_name[0], "getsem_task1");
+    getsem_task1_got_sem++;
+    OSSemPost(shared_resource_sem);
+    OSTimeDlyHMSM(0, 0, 0, 100);
+  }
+}
+
+void getsem_task2(void* pdata)
+{
+  INT8U return_code = OS_NO_ERR;
+  while (1)
+  {
+    OSSemPend(shared_resource_sem, 0, &return_code);
+    strcpy(&sem_owner_task_name[0], "getsem_task2");
+    alt_ucosii_check_return_code(return_code);
+    getsem_task2_got_sem++;
+    OSSemPost(shared_resource_sem);
+    OSTimeDlyHMSM(0, 0, 0, 130);
+  }
+}
+
+void send_task(void* pdata)
+{
+  INT8U return_code = OS_NO_ERR;
+  INT32U  msg = 0;
+  OS_Q_DATA queue_data;
+  while (1)
+  {
+	  void* button = OSMboxPend(mBox, 0, &return_code);
+	  alt_ucosii_check_return_code(return_code);
+	  OSQPostOpt(msgqueue, button, OS_POST_OPT_BROADCAST);
+	  alt_ucosii_check_return_code(return_code);
+	  number_of_messages_sent++;
+  }
+}
+void receive_task2(void* pdata)
+{
+  INT8U return_code = OS_NO_ERR;
+
+  while (1)
+  {
+	  INT8U msg = (INT8U) OSQPend(msgqueue, 0, &return_code);
+	  alt_ucosii_check_return_code(return_code);
+
+	  OSSemPend(shared_resource_sem, 0, &return_code);
+	  alt_ucosii_check_return_code(return_code);
+  }
+
+	  number_of_messages_received_task2++;
+
+	  OSSemPost(shared_resource_sem);
+
+
+}
+void  initialize_task(void* pdata)
+{
+  INT8U return_code = OS_NO_ERR;
+
+  initOSDataStructs();
+
+  initCreateTasks();
+
+  initTimer();
+
+  return_code = OSTaskDel(OS_PRIO_SELF);
+  alt_ucosii_check_return_code(return_code);
+  while (1);
+}
+int main (int argc, char* argv[], char* envp[])
+{
+	IOWR_ALTERA_AVALON_PIO_DATA(SEVEN_SEG_BASE, 0xffffffff);
+
+	init_button_piof();
+
+	INT8U return_code = OS_NO_ERR;
+	return_code = OSTaskCreate(
+			initialize_task,
+			NULL,
+			(void *)&initialize_task_stk[TASK_STACKSIZE-1],
+			INITIALIZE_TASK_PRIORITY
+			);
+
+	alt_ucosii_check_return_code(return_code);
+
+	OSStart();
+
+	return 0;
+
+}
+
+
+int initOSDataStructs(void)
+{
+  msgqueue = OSQCreate(&msgqueueTbl[0], MSG_QUEUE_SIZE);
+  mBox = OSMboxCreate((void *)0);
+  timerqueue = OSQCreate(&timerqueueTbl[0], MSG_QUEUE_SIZE);
+  shared_resource_sem = OSSemCreate(1);
+  int_sem = OSSemCreate(1);
+  return 0;
+}
+
+int initCreateTasks(void)
+{
+  INT8U return_code = OS_NO_ERR;
+
+  return_code = OSTaskCreate(getsem_task1,
+                             NULL,
+                             (void *)&getsem_task1_stk[TASK_STACKSIZE-1],
+                             GETSEM_TASK1_PRIORITY);
+  return_code = OSTaskCreate(getsem_task2,
+                             NULL,
+                             (void *)&getsem_task2_stk[TASK_STACKSIZE-1],
+                             GETSEM_TASK2_PRIORITY);
+  return_code = OSTaskCreate(receive_task1,
+                             NULL,
+                             (void *)&receive_task1_stk[TASK_STACKSIZE-1],
+                             RECEIVE_TASK1_PRIORITY);
+  alt_ucosii_check_return_code(return_code);
+  return_code = OSTaskCreate(receive_task2,
+                             NULL,
+                             (void *)&receive_task2_stk[TASK_STACKSIZE-1],
+                             RECEIVE_TASK2_PRIORITY);
+  alt_ucosii_check_return_code(return_code);
+  return_code = OSTaskCreate(send_task,
+                             NULL,
+                             (void *)&send_task_stk[TASK_STACKSIZE-1],
+                             SEND_TASK_PRIORITY);
+  alt_ucosii_check_return_code(return_code);
+  return_code = OSTaskCreate(print_status_task,
+                             NULL,
+                             (void *)&print_status_task_stk[TASK_STACKSIZE-1],
+                             PRINT_STATUS_TASK_PRIORITY);
+  alt_ucosii_check_return_code(return_code);
+  return_code = OSTaskCreate(start_timer,
+                               NULL,
+                               (void *)&start_timer_stk[TASK_STACKSIZE-1],
+  							 STARTTIMER_TASK_PRIORITY);
+    alt_ucosii_check_return_code(return_code);
+  return 0;
+}
+int main (int argc, char* argv[], char* envp[])
+{
+	IOWR_ALTERA_AVALON_PIO_DATA(SEVEN_SEG_BASE, 0xffffffff);
+	init_button_piof();
+	INT8U return_code = OS_NO_ERR;
+	return_code = OSTaskCreate(
+			initialize_task,
+			NULL,
+			(void *)&initialize_task_stk[TASK_STACKSIZE-1],
+			INITIALIZE_TASK_PRIORITY
+			);
+	alt_ucosii_check_return_code(return_code);
+	OSStart();
+	return 0;
+}
+
+/* Initialize the button_pio. */
+static void init_button_piof()
+{
+	/* Enable all 4 button interrupts. */
+	IOWR_ALTERA_AVALON_PIO_IRQ_MASK(BUTTONS_BASE, 0xf);
+	/* Reset the edge capture register. */
+	IOWR_ALTERA_AVALON_PIO_EDGE_CAP(BUTTONS_BASE, 0x0);
+	/* Register the ISR. */
+	#ifdef ALT_ENHANCED_INTERRUPT_API_PRESENT
+	alt_ic_isr_register(BUTTONS_IRQ_INTERRUPT_CONTROLLER_ID,BUTTONS_IRQ,handle_button_interrupts,0, 0x0);
+	#else
+	alt_irq_register(BUTTON_PIO_IRQ,0, handle_button_interrupts);
+	#endif
+}
+//Таймер для ШИМ
+OS_TMR *MyTmr2;
+//Переменные для ШИМ 
+int pwm = 0;
+int up = 0;
+int tmp = 0;
+int counter = 0;
+int counterSize = 25;
+int currentCounter = 0;
+void onOff(int cmd){
+	if(cmd == 1){
+		INT32U ticks = OSTimeGet();
+		INT32U totalSeconds = ticks / OS_TICKS_PER_SEC;
+		INT32U minutes = (totalSeconds % 3600) / 60;
+
+		INT32U totalSeconds1 = ticks / OS_TICKS_PER_SEC;
+		INT32U seconds = totalSeconds1 % 60;
+
+		int t = minutes / 10;
+		int x = minutes % 10;
+
+		int z = seconds / 10;
+		int q = seconds % 10;
+
+		set_hex_data(t, 3);
+		set_hex_data(x, 2);
+		set_hex_data(z, 1);
+		set_hex_data(q, 0);
+	}else if(cmd == 0){
+		IOWR_ALTERA_AVALON_PIO_DATA(SEVEN_SEG_BASE, 0xffffffff);
+	}
+}
+int initTimer(void){
+	INT8U return_code = OS_NO_ERR;
+	MyTmr2 = OSTmrCreate
+			(0, 1, OS_TMR_OPT_PERIODIC, (OS_TMR_CALLBACK)call_back_button, NULL, NULL, &return_code );
+}
+void call_back_button(void *p_arg){
+
+	    counter++;
+		INT8U return_code = OS_NO_ERR;
+
+		if(counter != 6001){
+		if(counter <= 500){
+			if(pwm >= up){
+				onOff(1);
+			}else{
+				onOff(0);
+			}
+
+			up++;
+
+			if(up == 5){
+				up = 0;
+				tmp++;
+			}
+
+			if(tmp == 25){
+				pwm++;
+				tmp = 0;
+			}
+
+		}else if(counter > 500 && counter <= 5500){
+				onOff(1);
+				//return_code = OSQPostOpt(timerqueue, 0, OS_POST_OPT_BROADCAST);
+		}else if(counter > 5500 && counter <= 6000){
+			if(pwm >= up){
+				onOff(1);
+			}else{
+				onOff(0);
+			}
+
+			up++;
+
+			if(up == 5){
+				up = 0;
+				tmp++;
+			}
+
+			if(tmp == 25){
+				pwm--;
+				tmp = 0;
+			}
+		}
+		}else{
+			currentCounter = 0;
+			counter = 0;
+			pwm = 0;
+			tmp = 0;
+			up = 0;
+			counterSize = 25;
+			return_code = OSQPostOpt(timerqueue, 0, OS_POST_OPT_BROADCAST);
+		}
+}
